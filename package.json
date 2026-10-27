@@ -1,0 +1,11 @@
+{
+  "name": "page-antiplagio",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "frontend": "cd frontend && pnpm dev",
+    "backend": "cd backend && uvicorn main:app --reload --port 8000",
+    "dev": "pnpm run backend & pnpm run frontend",
+    "build": "cd frontend && pnpm build"
+  }
+}
