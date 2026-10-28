@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState, useCallback } from "react"
+import { connectWebSocket } from "@/lib/api"
 import type { WSMessage } from "@/types"
 
 interface UseWebSocketOptions {
@@ -30,8 +31,7 @@ export function useWebSocket(analysisId: string | null, options: UseWebSocketOpt
   useEffect(() => {
     if (!analysisId || !options.enabled) return
 
-    const wsUrl = `${process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000"}/ws/analyze/${analysisId}`
-    const ws = new WebSocket(wsUrl)
+    const ws = connectWebSocket(analysisId)
     wsRef.current = ws
 
     ws.onopen = () => setIsConnected(true)

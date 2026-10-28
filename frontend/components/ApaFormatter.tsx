@@ -1,6 +1,7 @@
 "use client"
 
 import { useState } from "react"
+import { API_BASE } from "@/lib/api"
 import { Card, CardHeader, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -68,7 +69,7 @@ export function ApaFormatter() {
     })
 
     try {
-      const res = await fetch("http://localhost:8000/api/format/citation", {
+      const res = await fetch(`${API_BASE}/api/format/citation`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: params,

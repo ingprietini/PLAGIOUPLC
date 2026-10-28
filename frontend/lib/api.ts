@@ -1,7 +1,9 @@
 import { cache } from "react"
 import type { AnalysisResponse, AnalysisResult, CitationRequest } from "@/types"
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? (
+  process.env.NODE_ENV === "development" ? "http://localhost:8000" : ""
+)
 
 interface ApiFetchOptions extends RequestInit {
   timeoutMs?: number
@@ -61,7 +63,9 @@ export const getAnalysis = cache(async (id: string): Promise<AnalysisResult> => 
 })
 
 export function connectWebSocket(analysisId: string): WebSocket {
-  const wsUrl = API_BASE.replace(/^http/, "ws")
+  const baseUrl = process.env.NEXT_PUBLIC_WS_URL ?? API_BASE
+  const origin = baseUrl || (typeof window !== "undefined" ? window.location.origin : "")
+  const wsUrl = origin.replace(/^http/, "ws")
   return new WebSocket(`${wsUrl}/ws/analyze/${analysisId}`)
 }
 
