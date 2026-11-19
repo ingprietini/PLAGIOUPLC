@@ -10,7 +10,21 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# Una palabra puede contener caracteres invisibles o cortarse con guion al final de línea
+# ("pala-" + salto + "bra"); ambos se unen al normalizar. Son trucos habituales para evadir detectores.
+_INVISIBLE = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+_TOKEN_RE = re.compile(r"[^\W_]+(?:(?:[" + _INVISIBLE + r"]+|-[ \t]*\r?\n[ \t]*)[^\W_]+)*", re.UNICODE)
+_INVISIBLE_RE = re.compile(r"[" + _INVISIBLE + r"]|-[ \t]*\r?\n[ \t]*")
+# Letras cirílicas/griegas que se ven idénticas a las latinas.
+_HOMOGLYPHS = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
+    "ԁ": "d", "һ": "h", "ӏ": "l", "ɡ": "g", "ν": "v", "ο": "o", "α": "a", "ε": "e", "ι": "i", "κ": "k",
+    "ρ": "p", "τ": "t", "υ": "u", "χ": "x",
+    "А": "a", "В": "b", "Е": "e", "К": "k", "М": "m", "Н": "h", "О": "o", "Р": "p", "С": "c", "Т": "t",
+    "Х": "x", "І": "i", "Ј": "j", "Ѕ": "s",
+})
+_LATIN_RE = re.compile(r"[a-zA-Z]")
+_QUOTE_RE = re.compile(r"[\"“«„]([^\"”»“«]{40,1500}?)[\"”»]", re.DOTALL)
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+|\n\s*\n+")
 _BIBLIO_HEADING_RE = re.compile(
     r"^\s*(?:\d+[.)]?\s*)?(referencias(?: bibliogr[aá]ficas)?|bibliograf[ií]a|fuentes consultadas|"
@@ -70,7 +84,35 @@ def strip_accents(value: str) -> str:
 
 
 def normalize_token(token: str) -> str:
-    return strip_accents(token.lower())
+    token = _INVISIBLE_RE.sub("", token)
+    if _LATIN_RE.search(token):
+        # Solo se traducen homoglifos en palabras mixtas: un texto realmente en ruso o griego no se altera.
+        token = token.translate(_HOMOGLYPHS)
+    return strip_accents(unicodedata.normalize("NFKC", token).lower())
+
+
+def count_evasion_marks(text: str) -> dict:
+    """Cuenta caracteres invisibles y homoglifos incrustados en palabras latinas."""
+    invisible = sum(text.count(ch) for ch in _INVISIBLE if ch != "­")
+    homoglyph_words = 0
+    for m in _TOKEN_RE.finditer(text or ""):
+        word = m.group()
+        if _LATIN_RE.search(word) and word != word.translate(_HOMOGLYPHS):
+            homoglyph_words += 1
+    return {"invisible_chars": invisible, "homoglyph_words": homoglyph_words}
+
+
+def quoted_token_ranges(text: str, tokens: "Tokens") -> list[tuple[int, int]]:
+    """Rangos de tokens [inicio, fin) que están entre comillas (citas textuales)."""
+    ranges: list[tuple[int, int]] = []
+    starts = [s for s, _ in tokens.spans]
+    import bisect
+    for m in _QUOTE_RE.finditer(text or ""):
+        a = bisect.bisect_left(starts, m.start(1))
+        b = bisect.bisect_left(starts, m.end(1))
+        if b - a >= 6:
+            ranges.append((a, b))
+    return ranges
 
 
 @dataclass(frozen=True)

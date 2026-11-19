@@ -196,6 +196,45 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+@app.get("/api/diagnostics/search")
+async def diagnostics_search():
+    """Prueba cada proveedor de búsqueda desde el servidor (sin caché)."""
+    import time
+    from ddgs import DDGS
+    from config import SEARCH_WEB_ENGINES
+    from plagiarism import search as search_mod
+
+    query = "En un lugar de la Mancha de cuyo nombre no quiero acordarme no ha mucho tiempo que vivía un hidalgo"
+
+    def run_engine(engine: str) -> dict:
+        start = time.time()
+        try:
+            results = DDGS(timeout=10).text(query, max_results=5, backend=engine, region="es-es") or []
+            return {"ok": bool(results), "results": len(results), "seconds": round(time.time() - start, 1)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:160], "seconds": round(time.time() - start, 1)}
+
+    engines = await asyncio.gather(*(asyncio.to_thread(run_engine, e) for e in SEARCH_WEB_ENGINES))
+    report = {"web": dict(zip(SEARCH_WEB_ENGINES, engines))}
+
+    client = await search_mod.get_api_client()
+    checks = {
+        "openalex": ("https://api.openalex.org/works", {"search": "hidalgo lanza astillero", "per-page": 1}),
+        "crossref": ("https://api.crossref.org/works", {"query": "hidalgo lanza astillero", "rows": 1}),
+        "wikipedia": ("https://es.wikipedia.org/w/api.php",
+                      {"action": "query", "list": "search", "srsearch": "hidalgo lanza astillero", "format": "json"}),
+    }
+    apis = {}
+    for name, (url, params) in checks.items():
+        try:
+            r = await client.get(url, params=params)
+            apis[name] = {"ok": r.status_code == 200, "status": r.status_code}
+        except Exception as exc:
+            apis[name] = {"ok": False, "error": str(exc)[:160]}
+    report["apis"] = apis
+    return report
+
+
 @app.get("/")
 async def root():
     return {
@@ -298,6 +337,10 @@ async def get_analysis(analysis_id: str, db: Session = Depends(get_db)):
                 "longest_match_words": metrics.get("longest_match_words"),
                 "source_word_count": metrics.get("source_word_count"),
                 "verified_full_text": metrics.get("verified_full_text"),
+                "quoted_similarity": metrics.get("quoted_similarity"),
+                "exclusive_similarity": metrics.get("exclusive_similarity"),
+                "source_type": metrics.get("source_type"),
+                "providers": metrics.get("providers"),
             }
         )
 
@@ -637,7 +680,7 @@ async def websocket_analyze(websocket: WebSocket, analysis_id: str):
             except Exception:
                 pass
 
-        report = await run_plagiarism_check(text, progress=send_progress)
+        report = await run_plagiarism_check(text, progress=send_progress, analysis_id=analysis_id)
         sources_to_save = report.sources
 
         await websocket.send_json({
@@ -664,6 +707,10 @@ async def websocket_analyze(websocket: WebSocket, analysis_id: str):
                     "longest_match_words": src["longest_match_words"],
                     "source_word_count": src["source_word_count"],
                     "verified_full_text": src["verified_full_text"],
+                    "quoted_similarity": src["quoted_similarity"],
+                    "exclusive_similarity": src["exclusive_similarity"],
+                    "source_type": src["source_type"],
+                    "providers": src["providers"],
                 },
             }
 

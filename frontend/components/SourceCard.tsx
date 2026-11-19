@@ -5,6 +5,13 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import type { SourceResult } from "@/types"
 
+const SOURCE_TYPE_LABEL: Record<string, string> = {
+  web: "Internet",
+  academico: "Académica",
+  wikipedia: "Wikipedia",
+  repositorio: "Documento previo",
+}
+
 export const SourceCard = memo(function SourceCard({
   source,
   index,
@@ -39,15 +46,24 @@ export const SourceCard = memo(function SourceCard({
               <p className="truncate text-sm font-medium text-gray-900">
                 {source.title || "Sin título"}
               </p>
+              {source.source_type && (
+                <span className="shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-600">
+                  {SOURCE_TYPE_LABEL[source.source_type] ?? source.source_type}
+                </span>
+              )}
             </div>
-            <a
-              href={source.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="mt-1 block truncate text-xs text-primary-600 hover:underline"
-            >
-              {source.url}
-            </a>
+            {source.url.startsWith("http") ? (
+              <a
+                href={source.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-1 block truncate text-xs text-primary-600 hover:underline"
+              >
+                {source.url}
+              </a>
+            ) : (
+              <p className="mt-1 truncate text-xs text-gray-500">Repositorio interno de documentos analizados</p>
+            )}
             {source.source_snippet && (
               <p className="mt-2 text-xs text-gray-600 line-clamp-2">
                 {source.source_snippet}
@@ -62,7 +78,11 @@ export const SourceCard = memo(function SourceCard({
                 {matchingTexts.map((segment, matchIndex) => (
                   <div key={`${source.id}-match-${matchIndex}`} className="rounded border border-amber-200 bg-white p-2">
                     <p className="mb-1 text-[11px] font-medium text-amber-700">
-                      {segment.match_type === "paraphrase" ? "Paráfrasis" : "Copia literal"}
+                      {segment.match_type === "paraphrase"
+                        ? "Paráfrasis"
+                        : segment.match_type === "quote"
+                          ? "Cita entre comillas (no cuenta como plagio)"
+                          : "Copia literal"}
                       {segment.matched_words ? ` · ${segment.matched_words} palabras` : ""}
                     </p>
                     {segment.text_excerpt && (
@@ -87,6 +107,7 @@ export const SourceCard = memo(function SourceCard({
             {(source.exact_similarity != null || source.paraphrase_similarity != null) && (
               <p className="mt-2 text-[11px] text-gray-500">
                 Literal: {source.exact_similarity ?? 0}% · Paráfrasis: {source.paraphrase_similarity ?? 0}%
+                {source.quoted_similarity ? ` · Citas: ${source.quoted_similarity}%` : ""}
                 {source.verified_full_text === false && " · verificada solo con el fragmento del buscador"}
               </p>
             )}

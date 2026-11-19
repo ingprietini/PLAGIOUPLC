@@ -48,6 +48,19 @@ export interface AnalysisStats {
   sources_checked: number
   exact_similarity?: number
   paraphrase_similarity?: number
+  quoted_similarity?: number
+  originality?: number
+  similarity_by_type?: Record<string, { label: string; similarity: number }>
+  reliability?: "alta" | "media" | "baja"
+  reliability_note?: string
+  evasion?: { invisible_chars: number; homoglyph_words: number }
+  search_health?: {
+    web_queries: number
+    web_queries_ok: number
+    engines: Record<string, { ok: number; fail: number }>
+    apis: Record<string, { ok: number; fail: number }>
+    candidates: number
+  }
   bibliography_excluded?: boolean
   search_passes?: Array<Record<string, number>>
 }
@@ -58,7 +71,7 @@ export interface SourceResult {
   title: string
   similarity: number
   matched_text: Array<{
-    match_type?: "exact" | "paraphrase"
+    match_type?: "exact" | "paraphrase" | "quote"
     matched_words?: number
     similarity?: number
     matched_phrase?: string
@@ -74,6 +87,10 @@ export interface SourceResult {
   paraphrase_similarity?: number | null
   matched_words?: number | null
   verified_full_text?: boolean | null
+  quoted_similarity?: number | null
+  exclusive_similarity?: number | null
+  source_type?: "web" | "academico" | "wikipedia" | "repositorio" | null
+  providers?: string[] | null
 }
 
 export interface SuggestionResult {

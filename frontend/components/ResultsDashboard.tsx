@@ -121,10 +121,16 @@ export const ResultsDashboard = memo(function ResultsDashboard({
       <div>
         <div className="mb-2 flex items-center gap-3">
           <h2 className="text-xl font-semibold text-gray-900">Resumen de resultados</h2>
-          <Badge variant={stats.overall_similarity > 20 ? "danger" : "success"}>
+          <Badge
+            variant={
+              stats.overall_similarity > 20 ? "danger" : stats.reliability === "baja" ? "warning" : "success"
+            }
+          >
             {stats.overall_similarity > 20
               ? "Posible plagio detectado"
-              : "Originalidad aceptable"}
+              : stats.reliability === "baja"
+                ? "Resultado no concluyente"
+                : "Originalidad aceptable"}
           </Badge>
         </div>
         <p className="text-sm text-gray-500">

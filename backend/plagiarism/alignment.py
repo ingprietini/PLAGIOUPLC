@@ -11,9 +11,14 @@ Ahora, para cada fuente se calcula qué palabras del documento proceden de ella:
 2. Tramos: las coincidencias se unen tolerando unas pocas palabras cambiadas
    (copia con retoques) y se descartan tramos más cortos que MIN_MATCH_WORDS.
 3. Paráfrasis: oraciones no copiadas literalmente se comparan con las de la
-   fuente mediante TF-IDF de n-gramas de caracteres, ajustado SOLO con ese par
-   documento-fuente (resultado independiente del resto de fuentes), y exigiendo
-   además que compartan la mayoría de las palabras con contenido.
+   fuente mediante TF-IDF de n-gramas de caracteres (insensible al orden de las
+   palabras), ajustado SOLO con ese par documento-fuente. Se acepta si:
+   a) la similitud supera PARAPHRASE_THRESHOLD y comparten la mitad de las
+      palabras con contenido, o
+   b) la similitud es algo menor pero comparten ≥60% de raíces (Jaccard) y al
+      menos 6: oraciones reordenadas con algún sinónimo.
+4. Citas: tramos literales que están entre comillas se reportan como "cita" y
+   no suman a la similitud global (EXCLUDE_QUOTES).
 
 El resultado es determinista: mismo documento + misma fuente => mismo valor.
 """
@@ -24,8 +29,16 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from config import MATCH_GAP_WORDS, MIN_MATCH_WORDS, PARAPHRASE_THRESHOLD, SHINGLE_SIZE
-from plagiarism.text_utils import Sentence, Tokens, content_stem, is_content_word, split_sentences, tokenize
+from config import EXCLUDE_QUOTES, MATCH_GAP_WORDS, MIN_MATCH_WORDS, PARAPHRASE_THRESHOLD, SHINGLE_SIZE
+from plagiarism.text_utils import (
+    Sentence,
+    Tokens,
+    content_stem,
+    is_content_word,
+    quoted_token_ranges,
+    split_sentences,
+    tokenize,
+)
 
 
 @dataclass
@@ -36,6 +49,7 @@ class PreparedDocument:
     shingle_positions: dict[tuple[str, ...], list[int]]
     sentence_texts: list[str]
     sentence_stems: list[frozenset[str]]
+    quoted: frozenset[int] = frozenset()
 
 
 @dataclass
@@ -44,6 +58,7 @@ class SourceMatch:
     title: str
     exact_words: set[int] = field(default_factory=set)
     paraphrase_words: set[int] = field(default_factory=set)
+    quoted_words: set[int] = field(default_factory=set)
     segments: list[dict] = field(default_factory=list)
     source_word_count: int = 0
     longest_run: int = 0
@@ -75,7 +90,11 @@ def prepare_document(text: str) -> PreparedDocument:
         frozenset(content_stem(w) for w in tokens.words[s.start_token:s.end_token] if is_content_word(w))
         for s in sentences
     ]
-    return PreparedDocument(text, tokens, sentences, positions, sentence_texts, sentence_stems)
+    quoted: set[int] = set()
+    if EXCLUDE_QUOTES:
+        for a, b in quoted_token_ranges(text, tokens):
+            quoted.update(range(a, b))
+    return PreparedDocument(text, tokens, sentences, positions, sentence_texts, sentence_stems, frozenset(quoted))
 
 
 def _runs(indices: set[int], gap: int) -> list[tuple[int, int]]:
@@ -168,17 +187,22 @@ def _paraphrase_matches(
     sims = cosine_similarity(matrix[: len(doc_texts)], matrix[len(doc_texts):])
 
     found = []
+    relaxed = PARAPHRASE_THRESHOLD - 0.12
     for row, doc_idx in enumerate(candidates):
-        best = int(sims[row].argmax())
-        score = float(sims[row, best])
-        if score < PARAPHRASE_THRESHOLD:
-            continue
         doc_stems = doc.sentence_stems[doc_idx]
-        overlap = len(doc_stems & src_stems[best]) / max(1, len(doc_stems))
-        if overlap < 0.5:
-            continue
-        s = src_sentences[best]
-        found.append((doc_idx, s.start_token, s.end_token, round(score, 4)))
+        top = sims[row].argsort()[::-1][:5]
+        for best in top:
+            best = int(best)
+            score = float(sims[row, best])
+            if score < relaxed:
+                break
+            shared = len(doc_stems & src_stems[best])
+            overlap = shared / max(1, len(doc_stems))
+            jaccard = shared / max(1, len(doc_stems | src_stems[best]))
+            if (score >= PARAPHRASE_THRESHOLD and overlap >= 0.5) or (jaccard >= 0.6 and shared >= 6):
+                s = src_sentences[best]
+                found.append((doc_idx, s.start_token, s.end_token, round(score, 4)))
+                break
     return found
 
 
@@ -191,12 +215,17 @@ def compare(doc: PreparedDocument, url: str, title: str, src_text: str, max_segm
     runs, run_anchor = _exact_matches(doc, src_tokens)
     segments: list[tuple[int, dict]] = []
     for a, b in runs:
-        match.exact_words.update(range(a, b))
-        match.longest_run = max(match.longest_run, b - a)
+        run_words = set(range(a, b))
+        is_quote = bool(doc.quoted) and len(run_words & doc.quoted) >= 0.8 * len(run_words)
+        if is_quote:
+            match.quoted_words.update(run_words)
+        else:
+            match.exact_words.update(run_words)
+            match.longest_run = max(match.longest_run, b - a)
         src_start = max(0, run_anchor.get(a, 0))
         src_end = min(len(src_tokens), src_start + (b - a))
-        segments.append((b - a, {
-            "match_type": "exact",
+        segments.append(((b - a) * (0.3 if is_quote else 1.0), {
+            "match_type": "quote" if is_quote else "exact",
             "matched_words": b - a,
             "matched_phrase": doc.tokens.excerpt(doc.text, a, min(b, a + 14), max_chars=160),
             "text_excerpt": doc.tokens.excerpt(doc.text, a, b, context=6),
@@ -205,9 +234,11 @@ def compare(doc: PreparedDocument, url: str, title: str, src_text: str, max_segm
             "text_pos_end": doc.tokens.spans[b - 1][1],
         }))
 
-    for doc_idx, s_start, s_end, score in _paraphrase_matches(doc, src_text, src_tokens, match.exact_words):
+    for doc_idx, s_start, s_end, score in _paraphrase_matches(doc, src_text, src_tokens, match.exact_words | match.quoted_words):
         s = doc.sentences[doc_idx]
-        words = set(range(s.start_token, s.end_token)) - match.exact_words
+        words = set(range(s.start_token, s.end_token)) - match.exact_words - match.quoted_words
+        if len(words) < 4:
+            continue
         match.paraphrase_words.update(words)
         segments.append((len(words) * 0.8, {
             "match_type": "paraphrase",
