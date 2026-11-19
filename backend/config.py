@@ -54,6 +54,8 @@ MAX_API_QUERIES = _int("MAX_API_QUERIES", 15)
 API_USER_AGENT = os.getenv("API_USER_AGENT", "AntiPlagioBot/1.0 (+https://www.mediawiki.org/wiki/API:Etiquette)")
 # Brave Search API opcional (plan gratuito: https://brave.com/search/api/).
 BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+# Clave gratuita de OpenAlex (https://openalex.org/settings/api); sin ella limita mucho a servidores compartidos.
+OPENALEX_API_KEY = os.getenv("OPENALEX_API_KEY", "")
 REPOSITORY_MAX_DOCS = _int("REPOSITORY_MAX_DOCS", 300)
 
 # --- Descarga de páginas ---

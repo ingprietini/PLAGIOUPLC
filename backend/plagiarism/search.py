@@ -32,6 +32,7 @@ from config import (
     GOOGLE_CSE_ID,
     MAX_PAGE_BYTES,
     MAX_PAGE_CHARS,
+    OPENALEX_API_KEY,
 )
 from plagiarism import cache
 
@@ -229,6 +230,7 @@ async def search_openalex(query: str, num_results: int = 5) -> list[dict] | None
                     "search": query,
                     "per-page": num_results,
                     "select": "id,doi,title,abstract_inverted_index,primary_location,open_access",
+                    **({"api_key": OPENALEX_API_KEY} if OPENALEX_API_KEY else {}),
                 },
             )
             works = data.get("results", [])
