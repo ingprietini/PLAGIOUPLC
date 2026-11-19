@@ -16,3 +16,4 @@ ddgs
 lmscan
 reportlab
 python-dotenv
+psycopg2-binary

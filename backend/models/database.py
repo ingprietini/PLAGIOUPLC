@@ -7,13 +7,20 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import NullPool
 from config import DATABASE_URL
 
-db_dir = os.path.dirname(DATABASE_URL.replace("sqlite:///", ""))
-if db_dir:
-    os.makedirs(db_dir, exist_ok=True)
+_db_url = DATABASE_URL
+if _db_url.startswith("postgres://"):
+    # Render/Heroku entregan "postgres://", SQLAlchemy necesita "postgresql://".
+    _db_url = "postgresql://" + _db_url[len("postgres://"):]
+_is_sqlite = _db_url.startswith("sqlite")
+
+if _is_sqlite:
+    db_dir = os.path.dirname(_db_url.replace("sqlite:///", ""))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
 
 engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    _db_url,
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
     poolclass=NullPool,
     echo=False,
 )
@@ -68,6 +75,38 @@ class Suggestion(Base):
     position_end = Column(Integer, nullable=True)
 
     analysis = relationship("Analysis", back_populates="suggestions")
+
+
+class SearchCache(Base):
+    """Resultados de búsqueda web por consulta: mismo texto => mismas consultas => mismas fuentes."""
+
+    __tablename__ = "search_cache"
+
+    key = Column(String(64), primary_key=True)  # sha256(motor + consulta normalizada)
+    query = Column(Text, nullable=False)
+    results = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class PageCache(Base):
+    """Texto extraído de cada página/PDF descargado."""
+
+    __tablename__ = "page_cache"
+
+    key = Column(String(64), primary_key=True)  # sha256(url)
+    url = Column(Text, nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class TextSourceMemory(Base):
+    """Fuentes ya encontradas para un mismo texto; se vuelven a verificar en revisiones futuras."""
+
+    __tablename__ = "text_source_memory"
+
+    text_hash = Column(String(64), primary_key=True)
+    urls = Column(JSON, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 def init_db():

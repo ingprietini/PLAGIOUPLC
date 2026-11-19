@@ -13,14 +13,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from docx import Document
 
-from config import MAX_WORD_LIMIT, MAX_UPLOAD_SIZE, SIMILARITY_THRESHOLD, MAX_SOURCES_TO_CHECK
+from config import MAX_WORD_LIMIT, MAX_UPLOAD_SIZE
 from models.database import init_db, dispose_engine, get_db, Analysis, Source, Suggestion
 from parser import extract_text_from_bytes, get_word_count, truncate_text, SUPPORTED_EXTENSIONS
-from plagiarism.winnowing import analyze_plagiarism
-from plagiarism.tfidf import compute_similarity
-from plagiarism.search import search_chunks, hydrate_sources_content, close_client
-from plagiarism.source_normalizer import normalize_sources
-from plagiarism.scoring import rank_sources, build_stats
+from plagiarism.pipeline import run_plagiarism_check
+from plagiarism.search import close_client
+from plagiarism.scoring import build_stats
 from nlp.readability import analyze_readability
 from nlp.suggestions import get_improvement_suggestions
 from apa.formatter import format_apa, format_mla, format_chicago, CITATION_STYLES
@@ -277,7 +275,10 @@ async def get_analysis(analysis_id: str, db: Session = Depends(get_db)):
     if not analysis:
         raise HTTPException(status_code=404, detail="Análisis no encontrado")
 
-    sources = db.query(Source).filter(Source.analysis_id == analysis_id).all()
+    sources = sorted(
+        db.query(Source).filter(Source.analysis_id == analysis_id).all(),
+        key=lambda src: (-(src.similarity or 0), src.url),
+    )
     suggestions = db.query(Suggestion).filter(Suggestion.analysis_id == analysis_id).all()
 
     source_items = []
@@ -291,10 +292,12 @@ async def get_analysis(analysis_id: str, db: Session = Depends(get_db)):
                 "similarity": s.similarity,
                 "matched_text": segments,
                 "source_snippet": s.source_snippet,
-                "match_confidence": metrics.get("match_confidence"),
-                "content_quality": metrics.get("content_quality"),
-                "short_page_penalty": metrics.get("short_page_penalty"),
+                "exact_similarity": metrics.get("exact_similarity"),
+                "paraphrase_similarity": metrics.get("paraphrase_similarity"),
+                "matched_words": metrics.get("matched_words"),
+                "longest_match_words": metrics.get("longest_match_words"),
                 "source_word_count": metrics.get("source_word_count"),
+                "verified_full_text": metrics.get("verified_full_text"),
             }
         )
 
@@ -332,7 +335,7 @@ async def download_analysis_report_docx(analysis_id: str, db: Session = Depends(
     if not analysis:
         raise HTTPException(status_code=404, detail="Análisis no encontrado")
 
-    sources = db.query(Source).filter(Source.analysis_id == analysis_id).all()
+    sources = db.query(Source).filter(Source.analysis_id == analysis_id).order_by(Source.similarity.desc(), Source.url).all()
     suggestions = db.query(Suggestion).filter(Suggestion.analysis_id == analysis_id).all()
     stats = analysis.stats or {}
 
@@ -393,9 +396,9 @@ async def download_analysis_report_docx(analysis_id: str, db: Session = Depends(
             if metrics:
                 doc.add_paragraph(
                     "Métricas: "
-                    f"confianza={metrics.get('match_confidence', 0)}, "
-                    f"calidad={metrics.get('content_quality', 0)}, "
-                    f"penalización_corta={metrics.get('short_page_penalty', 0)}"
+                    f"copia literal={metrics.get('exact_similarity', 0)}%, "
+                    f"paráfrasis={metrics.get('paraphrase_similarity', 0)}%, "
+                    f"palabras coincidentes={metrics.get('matched_words', 0)}"
                 )
 
             if not segments:
@@ -446,7 +449,7 @@ async def download_analysis_report_pdf(analysis_id: str, db: Session = Depends(g
     SimpleDocTemplate = platypus.SimpleDocTemplate
     Spacer = platypus.Spacer
 
-    sources = db.query(Source).filter(Source.analysis_id == analysis_id).all()
+    sources = db.query(Source).filter(Source.analysis_id == analysis_id).order_by(Source.similarity.desc(), Source.url).all()
     suggestions = db.query(Suggestion).filter(Suggestion.analysis_id == analysis_id).all()
     stats = analysis.stats or {}
 
@@ -541,9 +544,9 @@ async def download_analysis_report_pdf(analysis_id: str, db: Session = Depends(g
             if metrics:
                 story.append(Paragraph(
                     "Métricas: "
-                    f"confianza={metrics.get('match_confidence', 0)}, "
-                    f"calidad={metrics.get('content_quality', 0)}, "
-                    f"penalización_corta={metrics.get('short_page_penalty', 0)}",
+                    f"copia literal={metrics.get('exact_similarity', 0)}%, "
+                    f"paráfrasis={metrics.get('paraphrase_similarity', 0)}%, "
+                    f"palabras coincidentes={metrics.get('matched_words', 0)}",
                     body,
                 ))
 
@@ -628,83 +631,14 @@ async def websocket_analyze(websocket: WebSocket, analysis_id: str):
         })
         ai_detection = detect_ai_text(text)
 
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 10,
-            "message": "Buscando fuentes en la web (DuckDuckGo)...",
-        })
-
-        async def send_progress(msg: str):
+        async def send_progress(progress: int, msg: str):
             try:
-                await websocket.send_json({"type": "progress", "progress": 10, "message": msg})
+                await websocket.send_json({"type": "progress", "progress": progress, "message": msg})
             except Exception:
                 pass
 
-        try:
-            web_sources = await search_chunks(text, progress_callback=send_progress)
-        except Exception:
-            web_sources = []
-
-        normalized_sources = normalize_sources(web_sources)
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 24,
-            "message": "Verificando contenido real de páginas encontradas...",
-        })
-
-        try:
-            normalized_sources = await hydrate_sources_content(
-                normalized_sources,
-                max_fetch=MAX_SOURCES_TO_CHECK,
-                progress_callback=send_progress,
-            )
-        except Exception:
-            pass
-
-        normalized_sources = normalized_sources[:MAX_SOURCES_TO_CHECK]
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 30,
-            "message": f"Se encontraron {len(normalized_sources)} posibles fuentes. Analizando similitudes...",
-        })
-
-        async def send_source_checking(source: dict, index: int, total: int):
-            try:
-                # Map source checking to 30-60% of global progress bar.
-                source_progress = 30 + int((index / max(1, total)) * 30)
-                await websocket.send_json(
-                    {
-                        "type": "source_checking",
-                        "progress": source_progress,
-                        "message": f"Analizando fuente {index}/{total}",
-                        "source": {
-                            "index": index,
-                            "total": total,
-                            "url": source.get("url", ""),
-                            "title": source.get("title", ""),
-                        },
-                    }
-                )
-            except Exception:
-                pass
-
-        winnowing_results = await analyze_plagiarism(
-            text,
-            normalized_sources,
-            progress_callback=send_source_checking,
-        )
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 60,
-            "message": "Calculando similitud TF-IDF...",
-        })
-
-        tfidf_scores = compute_similarity(text, normalized_sources)
-        tfidf_map = {s["url"]: s["similarity"] for s in tfidf_scores}
-        source_lookup = {s["url"]: s for s in normalized_sources}
+        report = await run_plagiarism_check(text, progress=send_progress)
+        sources_to_save = report.sources
 
         await websocket.send_json({
             "type": "progress",
@@ -720,22 +654,16 @@ async def websocket_analyze(websocket: WebSocket, analysis_id: str):
             "message": "Guardando resultados...",
         })
 
-        sources_to_save = rank_sources(
-            winnowing_results["results"],
-            tfidf_map,
-            source_lookup=source_lookup,
-            limit=MAX_SOURCES_TO_CHECK,
-        )
-
         for src in sources_to_save:
             payload = {
                 "segments": src.get("matching_segments", []),
                 "metrics": {
-                    "raw_similarity": src.get("raw_similarity", src.get("similarity", 0)),
-                    "match_confidence": src.get("match_confidence", 0),
-                    "content_quality": src.get("content_quality", 0),
-                    "short_page_penalty": src.get("short_page_penalty", 0),
-                    "source_word_count": src.get("source_word_count", 0),
+                    "exact_similarity": src["exact_similarity"],
+                    "paraphrase_similarity": src["paraphrase_similarity"],
+                    "matched_words": src["matched_words"],
+                    "longest_match_words": src["longest_match_words"],
+                    "source_word_count": src["source_word_count"],
+                    "verified_full_text": src["verified_full_text"],
                 },
             }
 
@@ -745,7 +673,7 @@ async def websocket_analyze(websocket: WebSocket, analysis_id: str):
                 title=src["title"],
                 similarity=src["similarity"],
                 matched_text=json.dumps(payload),
-                source_snippet=source_lookup.get(src["url"], {}).get("snippet", "")[:500],
+                source_snippet=(src.get("snippet") or "")[:500],
             )
             db.add(source)
 
@@ -762,12 +690,11 @@ async def websocket_analyze(websocket: WebSocket, analysis_id: str):
             )
 
         stats = build_stats(
-            sources=sources_to_save,
+            plagiarism_stats=report.stats,
             readability=readability,
             ai_detection=ai_detection,
             word_count=analysis.word_count,
-            similarity_threshold=SIMILARITY_THRESHOLD,
-            sources_checked=len(normalized_sources),
+            sources_checked=report.sources_checked,
         )
 
         analysis.stats = stats

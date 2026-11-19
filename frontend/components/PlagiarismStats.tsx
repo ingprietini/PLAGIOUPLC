@@ -26,7 +26,9 @@ export const PlagiarismStats = memo(function PlagiarismStats({
           </div>
           <p className="mt-2 text-2xl font-bold">{stats.overall_similarity}%</p>
           <p className="text-xs text-gray-500">
-            pico: {stats.max_similarity}% · prom: {stats.avg_similarity}%
+            {stats.exact_similarity != null
+              ? `literal: ${stats.exact_similarity}% · paráfrasis: ${stats.paraphrase_similarity ?? 0}%`
+              : `pico: ${stats.max_similarity}% · prom: ${stats.avg_similarity}%`}
           </p>
         </CardContent>
       </Card>
@@ -43,7 +45,7 @@ export const PlagiarismStats = memo(function PlagiarismStats({
         <CardContent className="p-4">
           <p className="text-sm text-gray-500">Fuentes con plagio</p>
           <p className="mt-2 text-2xl font-bold">{stats.sources_above_threshold}</p>
-          <p className="text-xs text-gray-500">superan el umbral mínimo</p>
+          <p className="text-xs text-gray-500">aportan al menos el 1% del texto</p>
         </CardContent>
       </Card>
 
@@ -51,7 +53,9 @@ export const PlagiarismStats = memo(function PlagiarismStats({
         <CardContent className="p-4">
           <p className="text-sm text-gray-500">Palabras analizadas</p>
           <p className="mt-2 text-2xl font-bold">{stats.word_count.toLocaleString()}</p>
-          <p className="text-xs text-gray-500">texto procesado</p>
+          <p className="text-xs text-gray-500">
+            {stats.bibliography_excluded ? "referencias bibliográficas excluidas" : "texto procesado"}
+          </p>
         </CardContent>
       </Card>
     </div>

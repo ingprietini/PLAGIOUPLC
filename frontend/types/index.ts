@@ -46,6 +46,10 @@ export interface AnalysisStats {
   ai_detection: AiDetectionResult | null
   word_count: number
   sources_checked: number
+  exact_similarity?: number
+  paraphrase_similarity?: number
+  bibliography_excluded?: boolean
+  search_passes?: Array<Record<string, number>>
 }
 
 export interface SourceResult {
@@ -54,6 +58,9 @@ export interface SourceResult {
   title: string
   similarity: number
   matched_text: Array<{
+    match_type?: "exact" | "paraphrase"
+    matched_words?: number
+    similarity?: number
     matched_phrase?: string
     source_excerpt?: string
     text_excerpt?: string
@@ -63,6 +70,10 @@ export interface SourceResult {
     source_pos_end?: number
   } | string>
   source_snippet: string
+  exact_similarity?: number | null
+  paraphrase_similarity?: number | null
+  matched_words?: number | null
+  verified_full_text?: boolean | null
 }
 
 export interface SuggestionResult {

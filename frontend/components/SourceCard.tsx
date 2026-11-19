@@ -15,15 +15,17 @@ export const SourceCard = memo(function SourceCard({
   const matchingTexts = (source.matched_text || [])
     .map((segment) =>
       typeof segment === "string"
-        ? { source_excerpt: segment, text_excerpt: "", matched_phrase: "" }
+        ? { source_excerpt: segment, text_excerpt: "", matched_phrase: "", match_type: undefined, matched_words: undefined }
         : {
+            match_type: segment.match_type,
+            matched_words: segment.matched_words,
             matched_phrase: segment.matched_phrase,
             source_excerpt: segment.source_excerpt,
             text_excerpt: segment.text_excerpt,
           }
     )
     .filter((segment) => segment.source_excerpt && (segment.matched_phrase || segment.text_excerpt))
-    .slice(0, 3)
+    .slice(0, 4)
 
   return (
     <Card className="transition-shadow hover:shadow-md">
@@ -59,17 +61,18 @@ export const SourceCard = memo(function SourceCard({
                 </p>
                 {matchingTexts.map((segment, matchIndex) => (
                   <div key={`${source.id}-match-${matchIndex}`} className="rounded border border-amber-200 bg-white p-2">
-                    {segment.matched_phrase && (
-                      <p className="mb-1 text-[11px] font-medium text-amber-700">
-                        Coincidencia clave: "{segment.matched_phrase}"
-                      </p>
-                    )}
-                    <p className="text-xs text-gray-700">"{segment.source_excerpt}"</p>
+                    <p className="mb-1 text-[11px] font-medium text-amber-700">
+                      {segment.match_type === "paraphrase" ? "Paráfrasis" : "Copia literal"}
+                      {segment.matched_words ? ` · ${segment.matched_words} palabras` : ""}
+                    </p>
                     {segment.text_excerpt && (
-                      <p className="mt-1 text-[11px] text-gray-500">
-                        Similar en tu texto: "{segment.text_excerpt}"
+                      <p className="text-xs text-gray-700">
+                        <span className="font-medium">Tu texto:</span> "{segment.text_excerpt}"
                       </p>
                     )}
+                    <p className="mt-1 text-[11px] text-gray-500">
+                      <span className="font-medium">Fuente:</span> "{segment.source_excerpt}"
+                    </p>
                   </div>
                 ))}
               </div>
@@ -77,7 +80,14 @@ export const SourceCard = memo(function SourceCard({
 
             {matchingTexts.length === 0 && (
               <p className="mt-3 text-[11px] text-gray-500">
-                Sin cita textual verificable en esta fuente; se muestra por similitud temática.
+                Sin fragmento verificable en esta fuente.
+              </p>
+            )}
+
+            {(source.exact_similarity != null || source.paraphrase_similarity != null) && (
+              <p className="mt-2 text-[11px] text-gray-500">
+                Literal: {source.exact_similarity ?? 0}% · Paráfrasis: {source.paraphrase_similarity ?? 0}%
+                {source.verified_full_text === false && " · verificada solo con el fragmento del buscador"}
               </p>
             )}
           </div>
