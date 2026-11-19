@@ -29,7 +29,9 @@ async function apiFetch<T>(url: string, options?: ApiFetchOptions): Promise<T> {
   }
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: "Error de conexión" }))
+    const err = await res.json().catch(() => ({
+      detail: `No se pudo conectar con el servidor de análisis (HTTP ${res.status} en ${url}). Verifica que el backend esté desplegado y que NEXT_PUBLIC_API_URL esté configurada.`,
+    }))
     throw new Error(err.detail || `HTTP ${res.status}`)
   }
 
