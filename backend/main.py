@@ -5,6 +5,7 @@ import io
 import re
 import importlib
 import html
+import time
 from datetime import datetime
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Form, UploadFile, File, HTTPException, Depends
@@ -14,15 +15,11 @@ from sqlalchemy.orm import Session
 from docx import Document
 
 from config import MAX_WORD_LIMIT, MAX_UPLOAD_SIZE
-from models.database import init_db, dispose_engine, get_db, Analysis, Source, Suggestion
+import analysis_runner
+from models.database import init_db, dispose_engine, get_db, Analysis, SessionLocal, Source, Suggestion
 from parser import extract_text_from_bytes, get_word_count, truncate_text, SUPPORTED_EXTENSIONS
-from plagiarism.pipeline import run_plagiarism_check
 from plagiarism.search import close_client
-from plagiarism.scoring import build_stats
-from nlp.readability import analyze_readability
-from nlp.suggestions import get_improvement_suggestions
 from apa.formatter import format_apa, format_mla, format_chicago, CITATION_STYLES
-from ai_detector.detector import detect_ai_text
 
 logger = logging.getLogger("antiplagio")
 
@@ -635,158 +632,70 @@ async def download_analysis_report_pdf(analysis_id: str, db: Session = Depends(g
     )
 
 
+def _db_progress(analysis_id: str) -> dict | None:
+    with SessionLocal() as db:
+        analysis = db.get(Analysis, analysis_id)
+        if not analysis:
+            return None
+        return {"status": analysis.status, "progress": analysis.progress or 0, "error": analysis.error,
+                "stats": analysis.stats}
+
+
+@app.get("/api/analyze/{analysis_id}/progress")
+async def analysis_progress(analysis_id: str):
+    """Progreso en vivo por HTTP (respaldo cuando el WebSocket se corta)."""
+    db_state = _db_progress(analysis_id)
+    if db_state is None:
+        raise HTTPException(status_code=404, detail="Análisis no encontrado")
+    if db_state["status"] in ("pending", "processing") and not analysis_runner.is_running(analysis_id):
+        analysis_runner.ensure_started(analysis_id)  # reanuda tras un reinicio del servidor
+    snap = analysis_runner.snapshot(analysis_id)
+    if snap is None or db_state["status"] == "completed":
+        return {"status": db_state["status"], "progress": 100 if db_state["status"] == "completed" else db_state["progress"],
+                "message": "Análisis completado" if db_state["status"] == "completed" else "En cola...",
+                "error": db_state["error"], "activity": None, "log": []}
+    return snap
+
+
 @app.websocket("/ws/analyze/{analysis_id}")
 async def websocket_analyze(websocket: WebSocket, analysis_id: str):
+    """Transmite el estado en vivo. Cerrar la conexión NO detiene el análisis."""
     await websocket.accept()
-
-    db = next(get_db())
     try:
-        analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-        if not analysis:
+        db_state = _db_progress(analysis_id)
+        if db_state is None:
             await websocket.send_json({"type": "error", "message": "Análisis no encontrado"})
-            await websocket.close()
+            return
+        if db_state["status"] == "completed":
+            await websocket.send_json({"type": "complete", "stats": db_state["stats"]})
             return
 
-        analysis.status = "processing"
-        analysis.progress = 0
-        db.commit()
-
-        await websocket.send_json({
-            "type": "status",
-            "status": "processing",
-            "progress": 0,
-            "message": "Iniciando análisis...",
-        })
-
-        text = analysis.original_text
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 5,
-            "message": "Analizando legibilidad del texto...",
-        })
-        readability = analyze_readability(text)
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 8,
-            "message": "Detectando texto generado por IA...",
-        })
-        ai_detection = detect_ai_text(text)
-
-        async def send_progress(progress: int, msg: str):
-            try:
-                await websocket.send_json({"type": "progress", "progress": progress, "message": msg})
-            except Exception:
-                pass
-
-        report = await run_plagiarism_check(text, progress=send_progress, analysis_id=analysis_id)
-        sources_to_save = report.sources
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 75,
-            "message": "Generando sugerencias de mejora...",
-        })
-
-        suggestions = get_improvement_suggestions(text)
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 85,
-            "message": "Guardando resultados...",
-        })
-
-        for src in sources_to_save:
-            payload = {
-                "segments": src.get("matching_segments", []),
-                "metrics": {
-                    "exact_similarity": src["exact_similarity"],
-                    "paraphrase_similarity": src["paraphrase_similarity"],
-                    "matched_words": src["matched_words"],
-                    "longest_match_words": src["longest_match_words"],
-                    "source_word_count": src["source_word_count"],
-                    "verified_full_text": src["verified_full_text"],
-                    "quoted_similarity": src["quoted_similarity"],
-                    "exclusive_similarity": src["exclusive_similarity"],
-                    "source_type": src["source_type"],
-                    "providers": src["providers"],
-                },
-            }
-
-            source = Source(
-                analysis_id=analysis_id,
-                url=src["url"],
-                title=src["title"],
-                similarity=src["similarity"],
-                matched_text=json.dumps(payload),
-                source_snippet=(src.get("snippet") or "")[:500],
-            )
-            db.add(source)
-
-        for sug in suggestions:
-            db.add(
-                Suggestion(
-                    analysis_id=analysis_id,
-                    type=sug["type"],
-                    severity=sug["severity"],
-                    suggestion_text=sug["suggestion"],
-                    explanation=sug.get("explanation", ""),
-                    improved_example=sug.get("improved_example"),
-                )
-            )
-
-        stats = build_stats(
-            plagiarism_stats=report.stats,
-            readability=readability,
-            ai_detection=ai_detection,
-            word_count=analysis.word_count,
-            sources_checked=report.sources_checked,
-        )
-
-        analysis.stats = stats
-        analysis.status = "completed"
-        analysis.progress = 100
-        analysis.completed_at = datetime.utcnow()
-        db.commit()
-
-        await websocket.send_json({
-            "type": "progress",
-            "progress": 100,
-            "message": "Análisis completado",
-        })
-
-        await websocket.send_json({
-            "type": "complete",
-            "stats": stats,
-            "sources_count": len(sources_to_save),
-            "suggestions_count": len(suggestions),
-        })
-
+        analysis_runner.ensure_started(analysis_id)
+        last_version = -1
+        last_sent = 0.0
+        while True:
+            snap = analysis_runner.snapshot(analysis_id)
+            now = time.monotonic()
+            if snap and (snap["version"] != last_version or now - last_sent >= 4):
+                # Además de los cambios, se envía un latido cada 4 s para mantener viva la conexión.
+                await websocket.send_json({"type": "progress", **snap})
+                last_version = snap["version"]
+                last_sent = now
+            if snap and snap["status"] == "completed":
+                state = analysis_runner.LIVE.get(analysis_id) or {}
+                await websocket.send_json({"type": "complete", "stats": state.get("stats")})
+                return
+            if snap and snap["status"] == "failed":
+                await websocket.send_json({"type": "error", "message": snap.get("error") or "Error durante el análisis"})
+                return
+            if not snap and not analysis_runner.is_running(analysis_id):
+                analysis_runner.ensure_started(analysis_id)
+            await asyncio.sleep(0.5)
     except WebSocketDisconnect:
-        try:
-            db.rollback()
-            analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-            if analysis and analysis.status == "processing":
-                analysis.status = "failed"
-                analysis.error = "Conexión interrumpida"
-                db.commit()
-        except Exception as inner:
-            logger.error("Error en WebSocketDisconnect handler: %s", inner)
-    except Exception as e:
-        logger.error("Error en WebSocket handler: %s", e)
-        try:
-            db.rollback()
-            analysis = db.query(Analysis).filter(Analysis.id == analysis_id).first()
-            if analysis:
-                analysis.status = "failed"
-                analysis.error = str(e)
-                db.commit()
-            await websocket.send_json({"type": "error", "message": str(e)})
-        except Exception:
-            pass
+        pass  # el análisis continúa en segundo plano
+    except Exception as exc:
+        logger.info("websocket closed: %s", exc)
     finally:
-        db.close()
         try:
             await websocket.close()
         except Exception:

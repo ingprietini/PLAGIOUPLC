@@ -32,6 +32,7 @@ from config import (
     GOOGLE_CSE_ID,
     MAX_PAGE_BYTES,
     MAX_PAGE_CHARS,
+    MAX_PDF_PAGES,
     OPENALEX_API_KEY,
 )
 from plagiarism import cache
@@ -344,9 +345,21 @@ def extract_text_from_html(html: str) -> str:
 
 
 def _extract_pdf_bytes(content: bytes) -> str:
+    """Texto de un PDF descargado, limitado a MAX_PDF_PAGES páginas y MAX_PAGE_CHARS caracteres."""
     try:
-        from parser import _extract_pdf
-        return _extract_pdf(content)[:MAX_PAGE_CHARS]
+        import io
+        import pdfplumber
+
+        parts: list[str] = []
+        size = 0
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages[:MAX_PDF_PAGES]:
+                text = page.extract_text() or ""
+                parts.append(text)
+                size += len(text)
+                if size >= MAX_PAGE_CHARS:
+                    break
+        return "\n\n".join(parts)[:MAX_PAGE_CHARS]
     except Exception as exc:
         logger.info("pdf extraction failed: %s", exc)
         return ""

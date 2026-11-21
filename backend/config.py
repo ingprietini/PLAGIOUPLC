@@ -65,6 +65,14 @@ FETCH_TIMEOUT = _float("FETCH_TIMEOUT", 15.0)
 MAX_PAGE_BYTES = _int("MAX_PAGE_BYTES", 6 * 1024 * 1024)
 MAX_PAGE_CHARS = _int("MAX_PAGE_CHARS", 150000)
 
+# --- Tiempos máximos (evitan que el análisis se quede trabado) ---
+SEARCH_CALL_TIMEOUT = _float("SEARCH_CALL_TIMEOUT", 20.0)     # una búsqueda en un motor/API
+FETCH_CALL_TIMEOUT = _float("FETCH_CALL_TIMEOUT", 30.0)       # descargar y extraer una página/PDF
+SEARCH_ROUND_TIMEOUT = _float("SEARCH_ROUND_TIMEOUT", 180.0)  # una ronda completa de búsquedas
+FETCH_ROUND_TIMEOUT = _float("FETCH_ROUND_TIMEOUT", 150.0)    # una ronda completa de verificación
+ANALYSIS_TIME_BUDGET = _float("ANALYSIS_TIME_BUDGET", 540.0)  # todo el análisis de plagio
+MAX_PDF_PAGES = _int("MAX_PDF_PAGES", 80)
+
 # --- Comparación ---
 SHINGLE_SIZE = _int("SHINGLE_SIZE", 5)          # palabras por huella
 MIN_MATCH_WORDS = _int("MIN_MATCH_WORDS", 8)     # longitud mínima de un tramo copiado

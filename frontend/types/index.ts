@@ -119,7 +119,41 @@ export interface AnalysisResult {
   completed_at: string
 }
 
-export interface WSMessage {
+export interface AnalysisActivity {
+  stage?: string
+  pass?: number | null
+  provider?: string
+  fragment?: string
+  position?: {
+    start: number
+    end: number
+    percent: number
+    sentence: number
+    sentences: number
+    text: string
+  } | null
+  url?: string
+  title?: string
+  done?: number
+  total?: number
+  similarity?: number
+  found_sources?: number
+}
+
+export interface LiveProgress {
+  status: string
+  progress: number
+  message: string
+  stage?: string
+  activity?: AnalysisActivity | null
+  log?: Array<{ t: number; text: string }>
+  found_sources?: number
+  elapsed_seconds?: number
+  seconds_since_update?: number
+  error?: string | null
+}
+
+export interface WSMessage extends Partial<Omit<LiveProgress, "status" | "progress" | "message">> {
   type: "status" | "progress" | "source_checking" | "complete" | "error"
   status?: string
   progress?: number

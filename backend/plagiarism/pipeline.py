@@ -17,6 +17,7 @@ orden determinista (nunca depende de qué respuesta de red llega primero).
 import asyncio
 import hashlib
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit
@@ -29,8 +30,11 @@ from config import (
     ENABLE_WIKIPEDIA,
     ENGINE_MAX_CONSECUTIVE_FAILS,
     ENGINES_PER_QUERY,
+    ANALYSIS_TIME_BUDGET,
     EXCLUDE_BIBLIOGRAPHY,
+    FETCH_CALL_TIMEOUT,
     FETCH_CONCURRENCY,
+    FETCH_ROUND_TIMEOUT,
     GOOGLE_API_KEY,
     GOOGLE_CSE_ID,
     MAX_API_QUERIES,
@@ -39,7 +43,9 @@ from config import (
     MAX_RESULTS_PER_QUERY,
     MAX_SOURCES_TO_CHECK,
     REPOSITORY_MAX_DOCS,
+    SEARCH_CALL_TIMEOUT,
     SEARCH_CONCURRENCY,
+    SEARCH_ROUND_TIMEOUT,
     SEARCH_DELAY,
     SEARCH_WEB_ENGINES,
     SOURCE_FLAG_COVERAGE,
@@ -66,7 +72,7 @@ from plagiarism.text_utils import (
 
 logger = logging.getLogger(__name__)
 
-ProgressFn = Callable[[int, str], Awaitable[None]]
+ProgressFn = Callable[..., Awaitable[None]]
 
 _ACADEMIC_PROVIDERS = {"openalex", "openalex_oa", "crossref"}
 _ACADEMIC_HOST_HINTS = (
@@ -113,7 +119,7 @@ class PlagiarismReport:
     passes: list[dict] = field(default_factory=list)
 
 
-async def _noop(_: int, __: str) -> None:
+async def _noop(*_args, **_kwargs) -> None:
     return None
 
 
@@ -168,6 +174,12 @@ class _Analysis:
         self.api_stats: dict[str, dict[str, int]] = {}
         self.web_queries_total = 0
         self.web_queries_ok = 0
+        # Comparar textos usa CPU: se limita para no saturar servidores pequeños.
+        self.compare_sem = asyncio.Semaphore(2)
+        self.query_origin: dict[str, int] = {}
+        self.current_pass = 0
+        self.pct = 10
+        self.deadline = time.monotonic() + ANALYSIS_TIME_BUDGET
 
     # ------------------------------------------------------------- utilidades
     def _sentence_ok(self, i: int) -> bool:
@@ -226,6 +238,59 @@ class _Analysis:
             if len(r.get("content") or "") > len(cand.provided_content):
                 cand.provided_content = r["content"]
 
+    # ------------------------------------------------------------- actividad en vivo
+    _ENGINE_NAMES = {"duckduckgo": "DuckDuckGo", "startpage": "Startpage", "google": "Google", "bing": "Bing",
+                     "yahoo": "Yahoo", "yandex": "Yandex", "brave": "Brave", "mojeek": "Mojeek"}
+
+    def _register_query(self, query: str, idx: int) -> str:
+        """Recuerda qué oración del documento origina cada consulta (para mostrarla en vivo)."""
+        if query and query not in self.query_origin:
+            self.query_origin[query] = idx
+        return query
+
+    def _position(self, query: str) -> dict | None:
+        idx = self.query_origin.get(query)
+        if idx is None:
+            return None
+        s = self.doc.sentences[idx]
+        start = self.doc.tokens.spans[s.start_token][0]
+        end = self.doc.tokens.spans[s.end_token - 1][1]
+        return {
+            "start": start,
+            "end": end,
+            "percent": round(start * 100 / max(1, len(self.doc.text)), 1),
+            "sentence": idx + 1,
+            "sentences": len(self.doc.sentences),
+            "text": self.doc.tokens.excerpt(self.doc.text, s.start_token, s.end_token, max_chars=260),
+        }
+
+    async def _activity(self, message: str, **activity) -> None:
+        activity.setdefault("pass", self.current_pass)
+        activity["found_sources"] = sum(1 for m in self.matches.values() if m.covered_words)
+        await self.progress(self.pct, message, activity)
+
+    def _remaining(self, cap: float) -> float:
+        return max(1.0, min(cap, self.deadline - time.monotonic()))
+
+    async def _gather_with_deadline(self, tasks: list[asyncio.Task], timeout: float, on_done) -> int:
+        """Espera las tareas hasta `timeout` s; cancela las que no terminaron. Devuelve cuántas se cancelaron."""
+        pending = set(tasks)
+        end = time.monotonic() + timeout
+        done_count = 0
+        while pending:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                break
+            finished, pending = await asyncio.wait(pending, timeout=min(remaining, 3.0),
+                                                   return_when=asyncio.FIRST_COMPLETED)
+            done_count += len(finished)
+            await on_done(done_count, len(tasks))
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        return len(pending)
+
     # ------------------------------------------------------------- búsqueda web
     def _engine_order(self, query: str) -> list[str]:
         alive = [e for e in SEARCH_WEB_ENGINES if self.engine_stats[e]["streak"] < ENGINE_MAX_CONSECUTIVE_FAILS]
@@ -240,6 +305,7 @@ class _Analysis:
         engines_with_results = 0
         attempts = 0
         any_response = False
+        position = self._position(query)
         for engine in self._engine_order(query):
             if engines_with_results >= ENGINES_PER_QUERY or attempts >= ENGINES_PER_QUERY + 3:
                 break
@@ -247,7 +313,17 @@ class _Analysis:
                 continue
             attempts += 1
             async with self.web_sem:
-                res = await search_web_engine(query, engine, MAX_RESULTS_PER_QUERY, self.region)
+                await self._activity(
+                    f"Buscando en {self._ENGINE_NAMES.get(engine, engine)}...",
+                    stage="search", provider=engine, fragment=query, position=position,
+                    log=f"Buscando en {self._ENGINE_NAMES.get(engine, engine)}: «{query[:70]}…»",
+                )
+                try:
+                    res = await asyncio.wait_for(
+                        search_web_engine(query, engine, MAX_RESULTS_PER_QUERY, self.region), SEARCH_CALL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    res = None
                 await asyncio.sleep(SEARCH_DELAY)
             stats = self.engine_stats[engine]
             if res:
@@ -259,23 +335,40 @@ class _Analysis:
             elif res is None or strict_empty:
                 stats["fail"] += 1
                 stats["streak"] += 1
+                if stats["streak"] == ENGINE_MAX_CONSECUTIVE_FAILS:
+                    await self._activity(f"{self._ENGINE_NAMES.get(engine, engine)} no responde; se omite.", stage="search",
+                                         provider=engine, log=f"{self._ENGINE_NAMES.get(engine, engine)} no responde: se deja de usar")
             else:
                 any_response = True
 
-        for extra in (search_brave_api(query, MAX_RESULTS_PER_QUERY, self.lang) if BRAVE_API_KEY else None,
-                      search_google_cse(query, MAX_RESULTS_PER_QUERY) if GOOGLE_API_KEY and GOOGLE_CSE_ID else None):
-            if extra is None:
+        for name, factory in (
+            ("Brave API", (lambda: search_brave_api(query, MAX_RESULTS_PER_QUERY, self.lang)) if BRAVE_API_KEY else None),
+            ("Google CSE", (lambda: search_google_cse(query, MAX_RESULTS_PER_QUERY)) if GOOGLE_API_KEY and GOOGLE_CSE_ID else None),
+        ):
+            if factory is None:
                 continue
             async with self.api_sem:
-                res = await extra
+                try:
+                    res = await asyncio.wait_for(factory(), SEARCH_CALL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    res = None
             if res:
                 collected.extend(res)
                 any_response = True
         return any_response, collected
 
-    async def _api_query(self, name: str, coro) -> list[dict]:
+    async def _api_query(self, name: str, query: str, factory) -> list[dict]:
+        label = {"openalex": "OpenAlex", "crossref": "Crossref", "wikipedia": "Wikipedia"}.get(name, name)
         async with self.provider_sems.get(name, self.api_sem):
-            res = await coro
+            await self._activity(
+                f"Consultando {label}...",
+                stage="search", provider=name, fragment=query, position=self._position(query),
+                log=f"Consultando {label}: {query[:70]}",
+            )
+            try:
+                res = await asyncio.wait_for(factory(), SEARCH_CALL_TIMEOUT)
+            except asyncio.TimeoutError:
+                res = None
             if name == "openalex":
                 await asyncio.sleep(0.25)
         stats = self.api_stats.setdefault(name, {"ok": 0, "fail": 0})
@@ -294,7 +387,7 @@ class _Analysis:
         label: str,
         strict_empty: bool,
     ) -> list[str]:
-        """Ejecuta una ronda de búsquedas; devuelve las consultas web fallidas.
+        """Ejecuta una ronda de búsquedas con tiempo máximo; devuelve las consultas web fallidas.
 
         Los resultados se incorporan en el orden de las consultas, no en el de llegada.
         """
@@ -303,25 +396,26 @@ class _Analysis:
             jobs.append(("web", q, asyncio.create_task(self._web_query(q, strict_empty))))
         for q in api_queries:
             if ENABLE_OPENALEX:
-                jobs.append(("api", q, asyncio.create_task(self._api_query("openalex", search_openalex(q)))))
+                jobs.append(("api", q, asyncio.create_task(self._api_query("openalex", q, lambda q=q: search_openalex(q)))))
             if ENABLE_CROSSREF:
-                jobs.append(("api", q, asyncio.create_task(self._api_query("crossref", search_crossref(q)))))
+                jobs.append(("api", q, asyncio.create_task(self._api_query("crossref", q, lambda q=q: search_crossref(q)))))
             if ENABLE_WIKIPEDIA:
-                jobs.append(("api", q, asyncio.create_task(self._api_query("wikipedia", search_wikipedia(q, self.lang)))))
+                jobs.append(("api", q, asyncio.create_task(
+                    self._api_query("wikipedia", q, lambda q=q: search_wikipedia(q, self.lang)))))
 
-        done = 0
-        for fut in asyncio.as_completed([t for _, _, t in jobs]):
-            try:
-                await fut
-            except Exception as exc:
-                logger.info("search job failed: %s", exc)
-            done += 1
-            if done == len(jobs) or done % 5 == 0:
-                await self.progress(lo + (hi - lo) * done // max(1, len(jobs)), f"{label}: {done}/{len(jobs)} búsquedas")
+        async def on_done(done: int, total: int) -> None:
+            self.pct = lo + (hi - lo) * done // max(1, total)
+            await self.progress(self.pct, f"{label}: {done}/{total} búsquedas completadas")
+
+        cancelled = await self._gather_with_deadline([t for _, _, t in jobs], self._remaining(SEARCH_ROUND_TIMEOUT), on_done)
+        if cancelled:
+            await self._activity(f"{label}: {cancelled} búsquedas tardaron demasiado y se omitieron.", stage="search",
+                                 log=f"{cancelled} búsquedas superaron el tiempo máximo")
 
         failed: list[str] = []
         for kind, q, task in jobs:
-            result = None if task.exception() else task.result()
+            ok_task = task.done() and not task.cancelled() and task.exception() is None
+            result = task.result() if ok_task else None
             if kind == "web":
                 self.queried.add(q)
                 self.web_queries_total += 1
@@ -337,29 +431,59 @@ class _Analysis:
 
     # ------------------------------------------------------------- descarga y comparación
     async def _fetch_and_compare(self, urls: list[str], lo: int, hi: int, label: str) -> None:
-        async def one(url: str):
-            if not self.candidates[url].needs_fetch:
-                return None
-            async with self.fetch_sem:
-                return await fetch_page_text(url)
+        """Descarga cada fuente y la compara con el documento (en un hilo aparte para no bloquear)."""
+        total = len(urls)
+        counter = {"n": 0}
+
+        async def one(url: str) -> None:
+            cand = self.candidates[url]
+            text: str | None = None
+            if cand.needs_fetch:
+                async with self.fetch_sem:
+                    counter["n"] += 1
+                    await self._activity(
+                        f"{label}: descargando fuente {counter['n']}/{total}",
+                        stage="fetch", url=url, title=cand.title or url, done=counter["n"], total=total,
+                        log=f"Descargando: {cand.title or url}"[:120],
+                    )
+                    try:
+                        text = await asyncio.wait_for(fetch_page_text(url), FETCH_CALL_TIMEOUT)
+                    except (asyncio.TimeoutError, Exception):
+                        text = None
+            cand.content = text
+            cand.fetch_failed = cand.needs_fetch and text is None
+            source_text = self._source_text(cand)
+            if not source_text:
+                self.matches.pop(url, None)
+                return
+            async with self.compare_sem:
+                match = await asyncio.to_thread(compare, self.doc, url, cand.title or url, source_text)
+            self.matches[url] = match
+            if match.covered_words:
+                share = round(len(match.covered_words) * 100 / max(1, len(self.doc.tokens)), 1)
+                await self._activity(
+                    f"Coincidencia encontrada en {cand.title or url}",
+                    stage="match", url=url, title=cand.title or url, similarity=share,
+                    log=f"Coincidencia de {share}% con: {cand.title or url}"[:140],
+                )
+
+        async def on_done(done: int, total_: int) -> None:
+            self.pct = lo + (hi - lo) * done // max(1, total_)
+            await self.progress(self.pct, f"{label}: {done}/{total_} fuentes verificadas")
 
         tasks = [asyncio.create_task(one(u)) for u in urls]
-        done = 0
-        for fut in asyncio.as_completed(tasks):
-            try:
-                await fut
-            except Exception:
-                pass
-            done += 1
-            if done == len(tasks) or done % 5 == 0:
-                await self.progress(lo + (hi - lo) * done // max(1, len(tasks)), f"{label}: {done}/{len(tasks)} fuentes")
-
-        for url, task in zip(urls, tasks):
-            cand = self.candidates[url]
-            text = None if task.exception() else task.result()
-            cand.fetch_failed = cand.needs_fetch and text is None
-            cand.content = text
-            self._compare(cand)
+        cancelled = await self._gather_with_deadline(tasks, self._remaining(FETCH_ROUND_TIMEOUT), on_done)
+        if cancelled:
+            # Las fuentes que no alcanzaron a verificarse se comparan con el fragmento del buscador.
+            for url, task in zip(urls, tasks):
+                if task.cancelled() and url not in self.matches:
+                    cand = self.candidates[url]
+                    cand.fetch_failed = True
+                    if cand.snippet or cand.provided_content:
+                        self.matches[url] = await asyncio.to_thread(
+                            compare, self.doc, url, cand.title or url, self._source_text(cand))
+            await self._activity(f"{label}: {cancelled} fuentes tardaron demasiado; se usó su fragmento.",
+                                 stage="fetch", log=f"{cancelled} fuentes superaron el tiempo máximo")
 
     def _source_text(self, cand: Candidate) -> str:
         page = cand.content or ""
@@ -367,13 +491,6 @@ class _Analysis:
         if cand.provided_content and cand.provided_content not in parts:
             parts.append(cand.provided_content)
         return "\n".join(p for p in parts if p).strip()
-
-    def _compare(self, cand: Candidate) -> None:
-        source_text = self._source_text(cand)
-        if not source_text:
-            self.matches.pop(cand.url, None)
-            return
-        self.matches[cand.url] = compare(self.doc, cand.url, cand.title or cand.url, source_text)
 
     def _covered(self) -> set[int]:
         covered: set[int] = set()
@@ -389,7 +506,7 @@ class _Analysis:
         return [u for u in selected if u not in self.matches]
 
     # ------------------------------------------------------------- repositorio interno
-    def _compare_repository(self) -> int:
+    async def _compare_repository(self) -> int:
         try:
             from models.database import Analysis, SessionLocal
             with SessionLocal() as db:
@@ -404,6 +521,8 @@ class _Analysis:
             return 0
         checked = 0
         for row_id, title, text, created in rows:
+            if time.monotonic() > self.deadline:
+                break
             if not text or text_fingerprint(strip_bibliography(text)[0]) == self.text_hash:
                 continue  # el mismo documento analizado antes no es plagio de sí mismo
             checked += 1
@@ -413,7 +532,9 @@ class _Analysis:
             cand.title = f"Documento analizado previamente: {title or 'sin título'} {date}".strip()
             cand.provided_content = text
             cand.providers.add("repositorio")
-            self._compare(cand)
+            await self._activity(f"Comparando con documentos previos ({checked})", stage="repository",
+                                 title=cand.title, log=f"Repositorio: {cand.title}"[:120])
+            self.matches[url] = await asyncio.to_thread(compare, self.doc, url, cand.title, text)
         return checked
 
     # ------------------------------------------------------------- pasadas
@@ -426,54 +547,73 @@ class _Analysis:
         self._add_results(remembered)
 
         # Pasada 1
-        await self.progress(10, "Pasada 1/4: búsqueda en buscadores web y bases académicas...")
-        web_q = list(dict.fromkeys(self._broad_query(i) for i in _spread_pick(searchable, MAX_QUERIES_PASS1, score)))
-        api_q = list(dict.fromkeys(q for q in (self._keyword_query(i) for i in _spread_pick(searchable, MAX_API_QUERIES, score)) if q))
+        self.current_pass, self.pct = 1, 10
+        await self._activity("Pasada 1/4: búsqueda en buscadores web y bases académicas...", stage="pass",
+                             log=f"Pasada 1: {len(searchable)} oraciones del documento se pueden investigar")
+        web_q = list(dict.fromkeys(
+            self._register_query(self._broad_query(i), i) for i in _spread_pick(searchable, MAX_QUERIES_PASS1, score)))
+        api_picks = _spread_pick(searchable, MAX_API_QUERIES, score)
+        api_q = list(dict.fromkeys(q for q in (self._register_query(self._keyword_query(i), i) for i in api_picks) if q))
         failed = await self._search_round(web_q, api_q, 10, 28, "Pasada 1/4", strict_empty=True)
         self.passes.append({"pass": 1, "web_queries": len(web_q), "api_queries": len(api_q), "failed": len(failed)})
 
         # Pasada 2
+        self.current_pass, self.pct = 2, 28
         retried = len(failed)
         for attempt in range(1, 3):
-            if not failed:
+            if not failed or self.deadline - time.monotonic() < 30:
                 break
             if not self._engine_order(failed[0]):
                 for st in self.engine_stats.values():  # todos caídos: se les da otra oportunidad
                     st["streak"] = 0
-            await self.progress(28, f"Pasada 2/4: reintentando {len(failed)} búsquedas (intento {attempt})...")
+            await self._activity(f"Pasada 2/4: reintentando {len(failed)} búsquedas (intento {attempt})...",
+                                 stage="pass", log=f"Pasada 2: reintento {attempt} de {len(failed)} búsquedas")
             await asyncio.sleep(2.0 * attempt)
             self.web_queries_total -= len(failed)  # el reintento reemplaza al intento original en las métricas
             failed = await self._search_round(failed, [], 28, 33, "Pasada 2/4", strict_empty=False)
         self.passes.append({"pass": 2, "retried": retried, "still_failed": len(failed)})
 
         to_fetch = self._to_fetch()
-        await self.progress(33, f"Verificando {len(to_fetch)} fuentes candidatas...")
+        self.pct = 33
+        await self._activity(f"Verificando {len(to_fetch)} fuentes candidatas...", stage="pass",
+                             log=f"Verificando {len(to_fetch)} fuentes candidatas")
         await self._fetch_and_compare(to_fetch, 33, 50, "Verificando fuentes")
 
         # Pasada 3: oraciones aún sin fuente.
-        covered = self._covered()
-        uncovered = [i for i in searchable if self._sentence_coverage(i, covered) < 0.3]
-        picks = _spread_pick(uncovered, MAX_QUERIES_PASS3, score)
-        web_q = [q for q in dict.fromkeys(self._exact_query(i) for i in picks) if q not in self.queried]
-        api_q = [q for q in dict.fromkeys(self._keyword_query(i) for i in picks[: max(0, MAX_API_QUERIES // 2)]) if q and q not in api_q]
+        self.current_pass, self.pct = 3, 50
+        web_q, api_q3 = [], []
         before = len(self.candidates)
-        if web_q or api_q:
-            await self.progress(50, "Pasada 3/4: búsqueda dirigida de frases exactas...")
-            await self._search_round(web_q, api_q, 50, 58, "Pasada 3/4", strict_empty=False)
-            await self._fetch_and_compare(self._to_fetch(), 58, 64, "Verificando nuevas fuentes")
-        self.passes.append({"pass": 3, "web_queries": len(web_q), "api_queries": len(api_q),
+        if self.deadline - time.monotonic() > 30:
+            covered = self._covered()
+            uncovered = [i for i in searchable if self._sentence_coverage(i, covered) < 0.3]
+            picks = _spread_pick(uncovered, MAX_QUERIES_PASS3, score)
+            web_q = [q for q in dict.fromkeys(self._register_query(self._exact_query(i), i) for i in picks)
+                     if q not in self.queried]
+            api_q3 = [q for q in dict.fromkeys(self._register_query(self._keyword_query(i), i)
+                                               for i in picks[: max(0, MAX_API_QUERIES // 2)]) if q and q not in api_q]
+            if web_q or api_q3:
+                await self._activity("Pasada 3/4: búsqueda dirigida de frases exactas...", stage="pass",
+                                     log=f"Pasada 3: {len(uncovered)} oraciones aún sin fuente")
+                await self._search_round(web_q, api_q3, 50, 58, "Pasada 3/4", strict_empty=False)
+                await self._fetch_and_compare(self._to_fetch(), 58, 64, "Verificando nuevas fuentes")
+        else:
+            await self._activity("Tiempo máximo alcanzado: se omite la pasada 3.", stage="pass",
+                                 log="Pasada 3 omitida por tiempo")
+        self.passes.append({"pass": 3, "web_queries": len(web_q), "api_queries": len(api_q3),
                             "new_sources": len(self.candidates) - before})
 
         # Pasada 4: verificación.
-        await self.progress(64, "Pasada 4/4: verificación final de fuentes...")
+        self.current_pass, self.pct = 4, 64
+        await self._activity("Pasada 4/4: verificación final de fuentes...", stage="pass", log="Pasada 4: verificación final")
         retry = sorted(u for u, c in self.candidates.items() if c.fetch_failed)
-        if retry:
+        if retry and self.deadline - time.monotonic() > 20:
             await asyncio.sleep(1.0)
             await self._fetch_and_compare(retry, 64, 68, "Pasada 4/4")
-        repo_checked = self._compare_repository() if ENABLE_REPOSITORY else 0
+        repo_checked = await self._compare_repository() if ENABLE_REPOSITORY else 0
         self.passes.append({"pass": 4, "refetched": len(retry), "remembered_sources": len(remembered),
                             "repository_docs": repo_checked})
-        await self.progress(70, "Calculando similitud global...")
+        self.pct = 70
+        await self._activity("Calculando similitud global...", stage="scoring", log="Calculando similitud global")
         return self._report()
 
     # ------------------------------------------------------------- resultado

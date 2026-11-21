@@ -1,5 +1,5 @@
 import { cache } from "react"
-import type { AnalysisResponse, AnalysisResult, CitationRequest } from "@/types"
+import type { AnalysisResponse, AnalysisResult, CitationRequest, LiveProgress } from "@/types"
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? (
   process.env.NODE_ENV === "development" ? "http://localhost:8000" : ""
@@ -63,6 +63,10 @@ export async function uploadFile(file: File): Promise<AnalysisResponse & { filen
 export const getAnalysis = cache(async (id: string): Promise<AnalysisResult> => {
   return apiFetch(`${API_BASE}/api/analyze/${id}`)
 })
+
+export async function getAnalysisProgress(id: string): Promise<LiveProgress> {
+  return apiFetch(`${API_BASE}/api/analyze/${id}/progress`, { timeoutMs: 15000 })
+}
 
 export function connectWebSocket(analysisId: string): WebSocket {
   const baseUrl = process.env.NEXT_PUBLIC_WS_URL ?? API_BASE
